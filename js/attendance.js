@@ -14,7 +14,9 @@ const SHEET_TOKEN = "Bagsh2026Irts7K9m4P2x";
 /* ================= DOM READY ================= */
 document.addEventListener("DOMContentLoaded", async () => {
   initShiftLabels();
+  activeAttendanceDate = currentDraftDate();
   updateCurrentDate();
+  const dailyRequest = loadDailyAttendance();
   await loadClassRosters();
   initElectiveRows();
   initTotals();
@@ -23,9 +25,24 @@ document.addEventListener("DOMContentLoaded", async () => {
   initLateStudentRows();
   initLateStudentDropdowns();
   initExportToolbar();
+  const sendButton = document.querySelector('[data-action="sheet"]');
+  if (sendButton) sendButton.disabled = true;
   initDutySignatures();
   initTeacherTimeControl();
+  updateExpectedStudentCounts();
+  const sharedRows = await dailyRequest;
+  sharedAttendanceLoaded = Array.isArray(sharedRows);
+  if (sharedAttendanceLoaded) applySharedAttendance(sharedRows);
+  if (!sharedAttendanceLoaded) {
+    const status = document.querySelector(".sheet-send-status");
+    if (status) {
+      status.textContent = "Өмнө илгээсэн ирцийг ачаалж чадсангүй. Дахин ачаалж шалгана уу.";
+      status.dataset.state = "error";
+    }
+  }
+  attendanceBaseline = attendanceDraftRows();
   restoreDraft();
+  if (sendButton) sendButton.disabled = !sharedAttendanceLoaded;
   updateExpectedStudentCounts();
   initAttendanceCountControls();
   initMobileLabels();
@@ -33,6 +50,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   calculateTotals();
   validateAttendance();
   initYearlyLateCounts();
+  const checkDay = () => {
+    if (currentDraftDate() !== activeAttendanceDate) window.location.reload();
+  };
+  window.setInterval(checkDay, 1000);
+  document.addEventListener("visibilitychange", checkDay);
+  window.addEventListener("pageshow", checkDay);
+  checkDay();
 
 
   document.addEventListener("input", () => {
@@ -180,8 +204,8 @@ function updateCurrentDate() {
   const dateLine = document.querySelector(".sub-line");
   if (!dateLine) return;
 
-  const today = new Date();
-  dateLine.textContent = `${today.getFullYear()} оны ${today.getMonth() + 1} сарын ${today.getDate()}-ны өдөр`;
+  const [year, month, day] = activeAttendanceDate.split("-").map(Number);
+  dateLine.textContent = `${year} оны ${month} сарын ${day}-ны өдөр`;
 }
 
 /* Presentation only: preserve cell order and the existing form controls. */
@@ -231,9 +255,68 @@ function initMobileInputs() {
 /* ================= REFRESH-SAFE DRAFT ================= */
 const DRAFT_STORAGE_KEY = `attendance-draft-v${document.body.dataset.shift || "1"}`;
 
-function currentDraftDate() {
-  const today = new Date();
-  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+let activeAttendanceDate;
+let attendanceBaseline = {};
+let sharedAttendanceLoaded = false;
+const attendanceDateFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Ulaanbaatar", year: "numeric", month: "2-digit", day: "2-digit"
+});
+
+function currentDraftDate(now = new Date()) {
+  const parts = Object.fromEntries(attendanceDateFormatter
+    .formatToParts(now).map(({ type, value }) => [type, value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function attendanceDraftRows() {
+  return Object.fromEntries([...document.querySelectorAll(".attendance-table tbody tr")]
+    .filter(row => normaliseGroupName(row.cells[2]?.textContent))
+    .map(row => [normaliseGroupName(row.cells[2]?.textContent), {
+      values: [3, 4, 5, 6, 7].map(index => row.cells[index]?.querySelector("input")?.value || ""),
+      absentNames: selectedNames(row.cells[8]),
+      leaveNames: selectedNames(row.cells[9])
+    }]));
+}
+
+function hasEnteredAttendance(row) {
+  return row.values[1] !== "" || row.values.slice(2).some(value => Number(value)) ||
+    row.absentNames || row.leaveNames;
+}
+
+async function loadDailyAttendance() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(SHEET_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({
+        token: SHEET_TOKEN, action: "dailyAttendance", date: activeAttendanceDate,
+        shift: document.body.dataset.shift || "1"
+      }),
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error("http_" + response.status);
+    const result = await response.json();
+    if (!result.ok || !Array.isArray(result.attendance)) throw new Error(result.error || "invalid_response");
+    return result.attendance;
+  } catch (error) {
+    console.warn("Shared attendance could not be loaded.", error);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function applySharedAttendance(savedRows) {
+  const groups = new Map(savedRows.map(([group, ...values]) => [normaliseGroupName(group), values]));
+  document.querySelectorAll(".attendance-table tbody tr").forEach(row => {
+    const values = groups.get(normaliseGroupName(row.cells[2]?.textContent));
+    values?.forEach((value, index) => {
+      const input = row.cells[index + 3]?.querySelector("input");
+      if (input) input.value = String(value);
+    });
+  });
 }
 
 function formControlValues(row) {
@@ -253,14 +336,9 @@ function restoreControlValues(row, values = []) {
 function saveDraft() {
   try {
     const draft = {
-      date: currentDraftDate(),
-      attendance: Object.fromEntries([...document.querySelectorAll(".attendance-table tbody tr")]
-        .filter(row => normaliseGroupName(row.cells[2]?.textContent))
-        .map(row => [normaliseGroupName(row.cells[2]?.textContent), {
-        values: [3, 4, 5, 6, 7].map(index => row.cells[index]?.querySelector("input")?.value || ""),
-        absentNames: selectedNames(row.cells[8]),
-        leaveNames: selectedNames(row.cells[9])
-      }])),
+      date: activeAttendanceDate,
+      attendance: attendanceDraftRows(),
+      attendanceBaseline,
       elective: [...document.querySelectorAll(".elective-table tbody tr")].map(formControlValues),
       dutyTeacherName: currentDutyTeacherName(),
       dutyTeacherNotes: document.getElementById("duty-teacher-notes")?.value || "",
@@ -282,7 +360,7 @@ function restoreDraft() {
     const rawDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
     if (!rawDraft) return;
     const draft = JSON.parse(rawDraft);
-    if (!draft || draft.date !== currentDraftDate() || !draft.attendance ||
+    if (!draft || draft.date !== activeAttendanceDate || !draft.attendance ||
         typeof draft.attendance !== "object" || Array.isArray(draft.attendance)) {
       localStorage.removeItem(DRAFT_STORAGE_KEY);
       return;
@@ -292,6 +370,11 @@ function restoreDraft() {
       const group = normaliseGroupName(row.cells[2]?.textContent);
       const savedRow = draft.attendance[group];
       if (!group || !savedRow || typeof savedRow !== "object") return;
+      const unchanged = sharedAttendanceLoaded && (draft.attendanceBaseline
+        ? JSON.stringify(savedRow) === JSON.stringify(draft.attendanceBaseline[group])
+        : !hasEnteredAttendance(savedRow));
+      if (unchanged && JSON.stringify(savedRow.values) !== JSON.stringify(attendanceBaseline[group]?.values)) return;
+      if (unchanged) attendanceBaseline[group] = savedRow;
       [3, 4, 5, 6, 7].forEach((cellIndex, valueIndex) => {
         const input = row.cells[cellIndex]?.querySelector("input");
         if (input && savedRow.values?.[valueIndex] !== undefined) input.value = savedRow.values[valueIndex];
@@ -1012,7 +1095,7 @@ function initExportToolbar() {
   if (!toolbar.querySelector(".submission-hint")) {
     const hint = document.createElement("p");
     hint.className = "submission-hint";
-    hint.textContent = "Ирцийн мэдээллийг бүрэн бөглөж, нягталсны дараа «Ирцийн мэдээ илгээх» товчийг дарна уу.";
+    hint.textContent = "Бөглөсөн ангиудаа илгээгээд, үлдсэн ангийн ирцийг дараа нь нэмж илгээж болно.";
     toolbar.append(hint);
   }
 
@@ -1031,7 +1114,7 @@ function initExportToolbar() {
 }
 
 /* ================= GOOGLE SHEETS ================= */
-function buildSheetPayload() {
+function buildSheetPayload(draftRows = attendanceDraftRows()) {
   const rows = selector => [...document.querySelectorAll(selector)].map(row =>
     [...row.cells].map(cell => {
       const input = cell.querySelector('input[type="number"]');
@@ -1042,15 +1125,21 @@ function buildSheetPayload() {
     }));
   return {
     token: SHEET_TOKEN,
-    date: currentDraftDate(),
+    action: "mergeAttendance",
+    date: activeAttendanceDate,
     shift: document.body.dataset.shift || "1",
     teacher: currentDutyTeacherName(),
     notes: dutyNotesWithSignatures(),
-    attendance: rows(".attendance-table tbody tr").filter(row => row[2]).map(row =>
+    attendance: rows(".attendance-table tbody tr").filter(row => {
+      const group = normaliseGroupName(row[2]);
+      const draft = draftRows[group];
+      return draft && hasEnteredAttendance(draft) &&
+        JSON.stringify(draft) !== JSON.stringify(attendanceBaseline[group]);
+    }).map(row =>
       row.map((value, index) => index >= 3 && index <= 7 ? Number(value) : value)),
-    electives: rows(".elective-table tbody tr").map(row =>
+    electives: rows(".elective-table tbody tr").filter(row => row[0]).map(row =>
       row.map((value, index) => index >= 1 && index <= 5 ? Number(value) : value)),
-    late: rows(".late-students-table tbody tr").filter(row => row.slice(1).some(Boolean))
+    late: rows(".late-students-table tbody tr").filter(row => row[1] && row[2])
       .flatMap(row => String(row[2]).split(", ").map(name => row.map((value, index) => index === 2 ? name : value)))
   };
 }
@@ -1058,7 +1147,11 @@ function buildSheetPayload() {
 async function sendToSheet() {
   const button = document.querySelector('[data-action="sheet"]');
   const status = document.querySelector('.sheet-send-status');
-  if (!button || button.disabled) return;
+  if (!button || button.disabled || !sharedAttendanceLoaded) return;
+  if (currentDraftDate() !== activeAttendanceDate) {
+    window.location.reload();
+    return;
+  }
   const message = (text, ok = false) => {
     status.textContent = text;
     status.dataset.state = ok ? "success" : "error";
@@ -1106,6 +1199,8 @@ async function sendToSheet() {
     ].filter(Boolean).join("\n\n");
     if (!window.confirm(review)) return;
   }
+  const submittedRows = attendanceDraftRows();
+  const payload = buildSheetPayload(submittedRows);
   const label = button.textContent;
   button.disabled = true;
   button.textContent = "Илгээж байна...";
@@ -1116,7 +1211,7 @@ async function sendToSheet() {
     const response = await fetch(SHEET_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify(buildSheetPayload()),
+      body: JSON.stringify(payload),
       redirect: "follow",
       signal: controller.signal
     });
@@ -1128,6 +1223,12 @@ async function sendToSheet() {
       throw new Error("invalid_response");
     }
     if (result.ok !== true) throw new Error(result.error || "server");
+    if (!Array.isArray(result.attendance)) throw new Error("invalid_response");
+    payload.attendance.forEach(row => {
+      const group = normaliseGroupName(row[2]);
+      attendanceBaseline[group] = submittedRows[group];
+    });
+    saveDraft();
     if (result.lateCounts) {
       yearlyLateHistory = result.lateCounts;
       refreshLateCounts();
@@ -1139,6 +1240,7 @@ async function sendToSheet() {
       unauthorized: "TOKEN буруу байна. Apps Script-ийн TOKEN болон SHEET_TOKEN ижил эсэхийг шалгана уу.",
       invalid_payload: "Илгээсэн мэдээлэл шаардлага хангахгүй байна. Ирцийн нийлбэр, хоцорсон сурагчийн анги болон нэрийг шалгана уу.",
       save_failed: "Apps Script мэдээллийг хадгалж чадсангүй. SPREADSHEET_ID, хүснэгтэд хандах эрх, баганын толгойг шалгана уу. Apps Script-ийн Executions хэсэгт дэлгэрэнгүй алдаа байна.",
+      day_changed: "Ирцийн өдөр солигдсон байна. Хуудсыг дахин ачаална уу.",
       busy: "Өөр илгээлт боловсруулж байна. Түр хүлээгээд дахин илгээнэ үү.",
       invalid_response: "Apps Script JSON хариу өгсөнгүй. Deploy-ийн Web app URL болон Who has access: Anyone тохиргоог шалгана уу."
     };
