@@ -1429,7 +1429,7 @@ function initExportToolbar() {
   if (!toolbar.querySelector(".submission-hint")) {
     const hint = document.createElement("p");
     hint.className = "submission-hint";
-    hint.textContent = "Бөглөсөн ангиудаа илгээгээд, үлдсэн ангийн ирцийг дараа нь нэмж илгээж болно.";
+    hint.textContent = "Ирцийн мэдээллийг бүрэн бөглөж, нягталсны дараа «Ирцийн мэдээ илгээх» товчийг дарна уу.";
     toolbar.append(hint);
   }
 
