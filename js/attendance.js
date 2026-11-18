@@ -25,7 +25,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   initLateStudentRows();
   initLateStudentDropdowns();
   initExportToolbar();
-  initTeacherAccess();
   const sendButton = document.querySelector('[data-action="sheet"]');
   if (sendButton) sendButton.disabled = true;
   initDutySignatures();
