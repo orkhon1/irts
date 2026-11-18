@@ -9,7 +9,6 @@
 
 // Google Sheets configuration (public in this static page).
 const SHEET_URL = "https://script.google.com/macros/s/AKfycbx4yo_NMIjqVB9fRBDGpRLIyjkhHGzdT6IovX6K9YIe06JB9VjTlYOZKFmtC6bCLcR55g/exec";
-const SHEET_TOKEN = "Bagsh2026Irts7K9m4P2x";
 
 /* ================= DOM READY ================= */
 document.addEventListener("DOMContentLoaded", async () => {
@@ -25,6 +24,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   initLateStudentRows();
   initLateStudentDropdowns();
   initExportToolbar();
+  initDraftStatus();
+  initSaverName();
   const sendButton = document.querySelector('[data-action="sheet"]');
   if (sendButton) sendButton.disabled = true;
   initDutySignatures();
@@ -47,7 +48,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
   attendanceBaseline = attendanceDraftRows();
-  restoreDraft(emptySections);
+  if (!receiveSharedDraft(snapshot)) restoreDraft(emptySections);
+  const saverInput = document.getElementById("duty-teacher-name");
+  if (saverInput) saverInput.value = localStorage.getItem(saverNameKey) || "";
+  if (draftBaseline && saverInput) draftBaseline.dutyTeacherName = saverInput.value;
+  queueSharedDraft();
   if (sendButton) sendButton.disabled = !sharedAttendanceLoaded;
   updateExpectedStudentCounts();
   initAttendanceCountControls();
@@ -60,12 +65,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (currentDraftDate() !== activeAttendanceDate) window.location.reload();
   };
   window.setInterval(checkDay, 1000);
-  window.setInterval(refreshSharedAttendance, 15000);
+  window.setInterval(refreshSharedAttendance, 25000);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshSharedAttendance();
+    if (document.hidden) flushSharedDraft();
+    else refreshSharedAttendance();
   });
   document.addEventListener("visibilitychange", checkDay);
   window.addEventListener("pageshow", checkDay);
+  window.addEventListener("pagehide", () => flushSharedDraft());
+  window.addEventListener("online", queueSharedDraft);
   checkDay();
 
 
@@ -268,9 +276,24 @@ const DRAFT_STORAGE_KEY = `attendance-draft-v${document.body.dataset.shift || "1
 let activeAttendanceDate;
 let attendanceBaseline = {};
 let sharedAttendanceLoaded = false;
-let teacherAccess = false;
-let teacherKey = sessionStorage.getItem("attendance-teacher-key") || "";
 let sectionBaseline;
+let draftRevision = 0;
+let draftBaseline;
+let draftTimer;
+let draftWriting = false;
+let draftConflict = false;
+let reloadConflictingDraft = false;
+let rejectedEmptyForm;
+let confirmEmpty = false;
+let nextDraftAttempt = 0;
+const saverNameKey = "attendance-saver-name";
+const deviceKey = "attendance-device-id";
+const deviceId = localStorage.getItem(deviceKey) || (
+  typeof crypto.randomUUID === "function" ? crypto.randomUUID() :
+    [...crypto.getRandomValues(new Uint8Array(16))].map(byte => byte.toString(16).padStart(2, "0")).join("")
+);
+localStorage.setItem(deviceKey, deviceId);
+sessionStorage.removeItem("attendance-teacher-key");
 const appliedSections = {};
 let refreshingAttendance = false;
 let sendingAttendance = false;
@@ -309,7 +332,7 @@ async function loadDailyAttendance() {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({
-        token: SHEET_TOKEN, teacherKey, action: "dailyAttendance", date: activeAttendanceDate,
+        action: "dailyAttendance", date: activeAttendanceDate,
         shift: document.body.dataset.shift || "1"
       }),
       signal: controller.signal
@@ -326,26 +349,34 @@ async function loadDailyAttendance() {
   }
 }
 
-function initTeacherAccess() {
+function initDraftStatus() {
   const status = document.querySelector(".sheet-send-status");
   if (!status) return;
-  const form = document.createElement("form");
-  const password = document.createElement("input");
-  password.type = "password";
-  password.autocomplete = "current-password";
-  password.placeholder = "Багшийн нэвтрэх код";
-  password.setAttribute("aria-label", password.placeholder);
-  password.required = true;
-  const button = document.createElement("button");
-  button.textContent = "Багшаар нэвтрэх";
-  form.append(password, button);
-  status.after(form);
-  form.addEventListener("submit", async event => {
-    event.preventDefault();
-    teacherKey = password.value.trim();
-    password.value = "";
-    await refreshSharedAttendance();
-  });
+  const draftStatus = document.createElement("p");
+  draftStatus.id = "shared-draft-status";
+  draftStatus.setAttribute("role", "status");
+  status.after(draftStatus);
+}
+
+function initSaverName() {
+  let input = document.getElementById("duty-teacher-name");
+  if (!input) {
+    const field = document.createElement("div");
+    field.className = "duty-teacher-field";
+    const label = document.createElement("label");
+    label.htmlFor = "duty-teacher-name";
+    label.textContent = "Жижүүр багшийн нэр";
+    input = document.createElement("input");
+    input.id = label.htmlFor;
+    input.type = "text";
+    input.autocomplete = "name";
+    field.append(label, input);
+    document.querySelector(".export-toolbar")?.before(field);
+  }
+  input.maxLength = 100;
+  const remembered = localStorage.getItem(saverNameKey) || "";
+  input.value = remembered;
+  input.addEventListener("input", () => localStorage.setItem(saverNameKey, input.value));
 }
 
 async function refreshSharedAttendance() {
@@ -353,13 +384,16 @@ async function refreshSharedAttendance() {
       !sectionBaseline) return;
   refreshingAttendance = true;
   const version = submissionVersion;
-  const key = teacherKey;
   try {
     const snapshot = await loadDailyAttendance();
-    if (!snapshot || version !== submissionVersion || key !== teacherKey ||
+    if (!snapshot || version !== submissionVersion ||
         currentDraftDate() !== activeAttendanceDate) return;
-    applySharedAttendance(snapshot, true);
-    applySharedSections(snapshot);
+    const cleanBeforeRefresh = draftBaseline !== undefined && sameValues(sharedDraftForm(), draftBaseline);
+    if (!snapshot.sharedDraft) applySharedAttendance(snapshot, true);
+    applySharedSections(snapshot, !snapshot.sharedDraft);
+    if (!snapshot.sharedDraft && cleanBeforeRefresh) draftBaseline = sharedDraftForm();
+    receiveSharedDraft(snapshot);
+    queueSharedDraft();
     sharedAttendanceLoaded = true;
     const button = document.querySelector('[data-action="sheet"]');
     if (button) button.disabled = false;
@@ -412,19 +446,8 @@ function restoreSharedNames(cell, names) {
   if (control) updateNameMultiSelect(control);
 }
 
-function applySharedSections(snapshot) {
-  teacherAccess = snapshot.teacherAccess === true;
-  if (teacherKey && !teacherAccess) {
-    teacherKey = "";
-    sessionStorage.removeItem("attendance-teacher-key");
-    const status = document.querySelector(".sheet-send-status");
-    status.textContent = "Багшийн нэвтрэх код тохироогүй байна.";
-    status.dataset.state = "error";
-  }
-  if (!snapshot.details) return;
-  sessionStorage.setItem("attendance-teacher-key", teacherKey);
-  const accessForm = document.querySelector(".sheet-send-status + form");
-  if (accessForm) accessForm.hidden = true;
+function applySharedSections(snapshot, applyFields = true) {
+  if (!applyFields || !snapshot.details) return;
   const local = attendanceSections();
   const details = snapshot.details;
   const lateGroups = new Map();
@@ -468,7 +491,7 @@ function restoreControlValues(row, values = []) {
 function attendanceSections() {
   return {
     elective: [...document.querySelectorAll(".elective-table tbody tr")].map(formControlValues),
-    dutyTeacherName: currentDutyTeacherName(),
+    dutyTeacherName: document.getElementById("duty-teacher-name")?.value || "",
     dutyTeacherNotes: document.getElementById("duty-teacher-notes")?.value || "",
     dutySignatures: Object.fromEntries([...document.querySelectorAll(".duty-signature-input")].map(input => [input.id, input.value])),
     teacherTimeControl: [...document.querySelectorAll(".teacher-time-table tbody tr")].map(formControlValues),
@@ -481,16 +504,169 @@ function attendanceSections() {
 
 function saveDraft() {
   try {
+    const form = sharedDraftForm();
     const draft = {
       date: activeAttendanceDate,
-      attendance: attendanceDraftRows(),
+      ...form,
+      draftRevision,
+      pendingSync: draftBaseline !== undefined && !sameValues(form, draftBaseline),
       attendanceBaseline,
-      sectionBaseline,
-      ...attendanceSections()
+      sectionBaseline
     };
     localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+    queueSharedDraft();
   } catch (error) {
     console.warn("Attendance draft could not be saved.", error);
+  }
+}
+
+function sharedDraftForm() {
+  return { attendance: attendanceDraftRows(), ...attendanceSections() };
+}
+
+function showDraftStatus(text) {
+  const status = document.getElementById("shared-draft-status");
+  if (status) status.textContent = text;
+}
+
+function receiveSharedDraft(snapshot) {
+  if (!snapshot) return false;
+  const remote = snapshot.sharedDraft;
+  if (!remote) {
+    if (draftBaseline === undefined) {
+      draftBaseline = { attendance: { ...attendanceBaseline }, ...sectionBaseline };
+      showDraftStatus("Төхөөрөмж хооронд хадгалах горим идэвхтэй.");
+    }
+    return false;
+  }
+  if (remote.revision === draftRevision || draftWriting || (draftConflict && !reloadConflictingDraft)) return true;
+  if (!reloadConflictingDraft && draftBaseline !== undefined && !sameValues(sharedDraftForm(), draftBaseline)) {
+    askToRefreshDraft();
+    return true;
+  }
+  const initialLoad = draftBaseline === undefined;
+  const acceptedConflict = reloadConflictingDraft;
+  restoreSharedDraftForm(remote.form);
+  draftConflict = false;
+  reloadConflictingDraft = false;
+  draftRevision = remote.revision;
+  draftBaseline = sharedDraftForm();
+  showLastDraftSave(remote);
+  if (acceptedConflict) saveDraft();
+  if (initialLoad) {
+    try {
+      const local = JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY));
+      if (local?.date === activeAttendanceDate && local.pendingSync && local.draftRevision === draftRevision) {
+        restoreSharedDraftForm(local);
+      }
+    } catch (error) {
+      console.warn("Local draft recovery failed.", error);
+    }
+  }
+  return true;
+}
+
+function restoreSharedDraftForm(form) {
+  document.querySelectorAll(".attendance-table tbody tr").forEach(row => {
+    const group = normaliseGroupName(row.cells[2]?.textContent);
+    const entry = form.attendance[group];
+    if (!entry) return;
+    entry.values.forEach((value, index) => {
+      const control = row.cells[index + 3]?.querySelector("input");
+      if (control) control.value = value;
+    });
+    restoreSharedNames(row.cells[8], entry.absentNames);
+    restoreSharedNames(row.cells[9], entry.leaveNames);
+  });
+  const keys = new Set(Object.keys(attendanceSections()));
+  keys.delete("dutyTeacherName");
+  restoreDraftSections(form, keys, true, true);
+  refreshLateCounts();
+}
+
+function showLastDraftSave(draft) {
+  const time = draft.updated_at && new Date(draft.updated_at);
+  const formatted = time && !Number.isNaN(time.getTime()) ? new Intl.DateTimeFormat("mn-MN", {
+    timeZone: "Asia/Ulaanbaatar", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+  }).format(time) : "";
+  showDraftStatus(formatted ? `Сүүлд хадгалсан: ${formatted}, ${draft.updated_by || "Тодорхойгүй"}` : "Ноорог хадгалагдсан.");
+}
+
+function askToRefreshDraft() {
+  if (draftConflict) return;
+  draftConflict = true;
+  saveDraft();
+  showDraftStatus("Өөр төхөөрөмжөөс өөрчлөлт орсон байна.");
+  if (window.confirm("Өөр төхөөрөмжөөс өөрчлөлт орсон байна, шинэчлэх үү?")) {
+    reloadConflictingDraft = true;
+    setTimeout(refreshSharedAttendance, 0);
+  }
+}
+
+function queueSharedDraft(delay = 450) {
+  if (draftConflict || draftBaseline === undefined || sendingAttendance) return;
+  const form = sharedDraftForm();
+  if (sameValues(form, draftBaseline) || sameValues(form, rejectedEmptyForm)) return;
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(flushSharedDraft, Math.max(delay, nextDraftAttempt - Date.now()));
+}
+
+async function flushSharedDraft() {
+  clearTimeout(draftTimer);
+  if (draftConflict || draftWriting || sendingAttendance || draftBaseline === undefined ||
+      currentDraftDate() !== activeAttendanceDate) return;
+  const form = sharedDraftForm();
+  if (sameValues(form, draftBaseline) || sameValues(form, rejectedEmptyForm)) return;
+  if (Date.now() < nextDraftAttempt) { queueSharedDraft(0); return; }
+  nextDraftAttempt = Date.now() + 1000;
+  draftWriting = true;
+  showDraftStatus("Ноорог хадгалж байна…");
+  const body = JSON.stringify({
+    action: "saveSharedDraft", date: activeAttendanceDate,
+    shift: document.body.dataset.shift || "1", revision: draftRevision, form, deviceId,
+    updated_by: form.dutyTeacherName, confirmEmpty
+  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(SHEET_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body,
+      signal: controller.signal,
+      keepalive: new Blob([body]).size <= 60 * 1024
+    });
+    if (!response.ok) throw new Error("http_" + response.status);
+    const result = await response.json();
+    if (result.error === "draft_conflict") {
+      askToRefreshDraft();
+      return;
+    }
+    if (result.error === "rate_limited") {
+      nextDraftAttempt = Math.max(nextDraftAttempt, Date.now() + (Number(result.retryAfter) || 1000));
+      queueSharedDraft(0);
+      return;
+    }
+    if (result.error === "confirm_empty") {
+      confirmEmpty = window.confirm("Бөглөсөн ноорогийг хоосон болгох уу?");
+      rejectedEmptyForm = confirmEmpty ? undefined : form;
+      if (confirmEmpty) queueSharedDraft(0);
+      else showDraftStatus("Өмнөх ноорог хадгалагдсан.");
+      return;
+    }
+    if (!result.ok) throw new Error(result.error);
+    confirmEmpty = false;
+    rejectedEmptyForm = undefined;
+    draftRevision = result.revision;
+    draftBaseline = form;
+    saveDraft();
+    showLastDraftSave(result);
+  } catch (error) {
+    console.warn("Shared draft could not be saved.", error);
+    showDraftStatus("Ноорог энэ төхөөрөмжид байна. Серверт түр хадгалж чадсангүй.");
+  } finally {
+    clearTimeout(timeout);
+    draftWriting = false;
   }
 }
 
@@ -529,9 +705,9 @@ function restoreDraft(emptySections) {
     });
 
     const edited = new Set(Object.keys(attendanceSections()).filter(key =>
-      !teacherAccess || (draft.sectionBaseline
+      (draft.sectionBaseline
         ? !sameValues(draft[key], draft.sectionBaseline[key])
-        : draft[key] !== undefined && !sameValues(draft[key], emptySections[key]))));
+        : draft[key] !== undefined && !sameValues(draft[key], emptySections?.[key]))));
     restoreDraftSections(draft, edited);
   } catch (error) {
     console.warn("Attendance draft could not be restored.", error);
@@ -540,28 +716,31 @@ function restoreDraft(emptySections) {
   }
 }
 
-function restoreDraftSections(draft, keys, shared = false) {
+function restoreDraftSections(draft, keys, shared = false, exact = false) {
   if (keys.has("elective")) {
     const savedElectives = Array.isArray(draft.elective) ? [...draft.elective] : [];
-    while (savedElectives.length > 3 && !savedElectives.at(-1)?.some(value => String(value || "").trim() && String(value) !== "0")) {
+    while (!exact && savedElectives.length > 3 && !savedElectives.at(-1)?.some(value => String(value || "").trim() && String(value) !== "0")) {
       savedElectives.pop();
     }
     const electiveTable = document.querySelector(".elective-table");
+    while (exact && electiveTable && electiveTable.tBodies[0].rows.length > Math.max(3, savedElectives.length)) electiveTable.tBodies[0].deleteRow(-1);
     while (electiveTable && electiveTable.tBodies[0].rows.length < savedElectives.length) electiveTable.addElectiveRow();
     [...document.querySelectorAll(".elective-table tbody tr")]
       .forEach((row, index) => restoreControlValues(row, draft.elective?.[index] || (shared ? ["", "", "", "0", "0", "0", ""] : [])));
 
   }
   const dutyTeacherName = document.getElementById("duty-teacher-name");
-  if (keys.has("dutyTeacherName") && dutyTeacherName) dutyTeacherName.value = draft.dutyTeacherName || "";
+  if (!shared && keys.has("dutyTeacherName") && dutyTeacherName) dutyTeacherName.value = draft.dutyTeacherName || "";
   const dutyTeacherNotes = document.getElementById("duty-teacher-notes");
   if (keys.has("dutyTeacherNotes") && dutyTeacherNotes) dutyTeacherNotes.value = draft.dutyTeacherNotes || "";
   if (keys.has("teacherTimeControl")) {
     const savedTimeRows = Array.isArray(draft.teacherTimeControl) ? [...draft.teacherTimeControl] : [];
     // Older drafts included five rows even when the last three were empty.
-    while (savedTimeRows.length > 2 && !savedTimeRows.at(-1)?.some(value => String(value || "").trim())) {
+    while (!exact && savedTimeRows.length > 2 && !savedTimeRows.at(-1)?.some(value => String(value || "").trim())) {
       savedTimeRows.pop();
     }
+    const timeBody = document.querySelector(".teacher-time-table tbody");
+    while (exact && timeBody && timeBody.rows.length > Math.max(2, savedTimeRows.length)) timeBody.deleteRow(-1);
     while (document.querySelectorAll(".teacher-time-table tbody tr").length < savedTimeRows.length) {
       document.querySelector(".teacher-time-table").addTimeRow();
     }
@@ -573,19 +752,20 @@ function restoreDraftSections(draft, keys, shared = false) {
     input.value = draft.dutySignatures?.[input.id] || "";
   });
   const completedTeacher = document.getElementById("completed-duty-teacher");
-  if (keys.has("dutyTeacherName") && completedTeacher && !draft.dutySignatures?.["completed-duty-teacher"] && draft.dutyTeacherName) {
+  if (!exact && keys.has("dutyTeacherName") && completedTeacher && !draft.dutySignatures?.["completed-duty-teacher"] && draft.dutyTeacherName) {
     completedTeacher.value = draft.dutyTeacherName;
   }
 
   if (keys.has("late")) {
     const savedLateRows = Array.isArray(draft.late) ? [...draft.late] : [];
-    while (savedLateRows.length > 3) {
+    while (!exact && savedLateRows.length > 3) {
       const last = savedLateRows.at(-1);
       const values = Array.isArray(last) ? last : last?.values;
       if (last?.studentNames || values?.some(value => String(value || "").trim())) break;
       savedLateRows.pop();
     }
     const lateTable = document.querySelector(".late-students-table");
+    while (exact && lateTable && lateTable.tBodies[0].rows.length > Math.max(3, savedLateRows.length)) lateTable.tBodies[0].deleteRow(-1);
     while (lateTable && lateTable.tBodies[0].rows.length < savedLateRows.length) lateTable.addLateRow();
     [...document.querySelectorAll(".late-students-table tbody tr")].forEach((row, index) => {
       const savedRow = draft.late?.[index] || (shared ? { values: ["", "", ""] } : null);
@@ -912,7 +1092,7 @@ async function initYearlyLateCounts() {
   try {
     const response = await fetch(SHEET_URL, {
       method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action: "lateHistory", token: SHEET_TOKEN, date: currentDraftDate() }),
+      body: JSON.stringify({ action: "lateHistory", date: currentDraftDate() }),
       signal: AbortSignal.timeout(30000)
     });
     const result = await response.json();
@@ -1272,7 +1452,6 @@ function buildSheetPayload(draftRows = attendanceDraftRows()) {
       return field ? field.value.trim() : cell.textContent.trim();
     }));
   return {
-    token: SHEET_TOKEN,
     action: "mergeAttendance",
     date: activeAttendanceDate,
     shift: document.body.dataset.shift || "1",
@@ -1296,6 +1475,10 @@ async function sendToSheet() {
   const button = document.querySelector('[data-action="sheet"]');
   const status = document.querySelector('.sheet-send-status');
   if (!button || button.disabled || !sharedAttendanceLoaded) return;
+  if (draftConflict || draftWriting) {
+    status.textContent = draftConflict ? "Өөр төхөөрөмжөөс өөрчлөлт орсон байна." : "Ноорог хадгалагдаж байна. Түр хүлээнэ үү.";
+    return;
+  }
   if (currentDraftDate() !== activeAttendanceDate) {
     window.location.reload();
     return;
@@ -1324,8 +1507,8 @@ async function sendToSheet() {
     (invalidNumber || error).scrollIntoView({ block: "center" });
     return;
   }
-  if (SHEET_URL === "ЭНД_APPS_SCRIPT_URL" || SHEET_TOKEN === "ЭНД_TOKEN") {
-    message("Google Sheet-ийн URL болон TOKEN-ийг тохируулна уу.");
+  if (SHEET_URL === "ЭНД_APPS_SCRIPT_URL") {
+    message("Google Sheet-ийн URL-ийг тохируулна уу.");
     return;
   }
   if (yearlyLateHistory === null && [...document.querySelectorAll(".late-students-table tbody tr")].some(row => selectedNames(row.cells[2]))) {
@@ -1347,15 +1530,29 @@ async function sendToSheet() {
     ].filter(Boolean).join("\n\n");
     if (!window.confirm(review)) return;
   }
+  if (!sameValues(sharedDraftForm(), draftBaseline)) {
+    button.disabled = true;
+    try {
+      const delay = nextDraftAttempt - Date.now();
+      if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+      await flushSharedDraft();
+    } finally {
+      button.disabled = false;
+    }
+    if (draftConflict || !sameValues(sharedDraftForm(), draftBaseline)) {
+      message("Ноорог хадгалагдсаны дараа дахин илгээнэ үү.");
+      return;
+    }
+  }
   const submittedRows = attendanceDraftRows();
   const sections = attendanceSections();
   const payload = buildSheetPayload(submittedRows);
-  payload.teacherKey = teacherKey;
+  payload.revision = draftRevision;
   if (sameValues(sections.elective, sectionBaseline.elective)) payload.electives = [];
   if (sameValues(sections.late, sectionBaseline.late)) payload.late = [];
   const { dutyTeacherNotes, dutySignatures, teacherTimeControl } = sections;
   if (["dutyTeacherNotes", "dutySignatures", "teacherTimeControl"].some(key => !sameValues(sections[key], sectionBaseline[key]))) {
-    if (teacherAccess) payload.dutyForm = { dutyTeacherNotes, dutySignatures, teacherTimeControl };
+    payload.dutyForm = { dutyTeacherNotes, dutySignatures, teacherTimeControl };
   } else {
     payload.teacher = "";
     payload.notes = "";
@@ -1383,6 +1580,7 @@ async function sendToSheet() {
     } catch (_) {
       throw new Error("invalid_response");
     }
+    if (result.error === "draft_conflict") askToRefreshDraft();
     if (result.ok !== true) throw new Error(result.error || "server");
     if (!Array.isArray(result.attendance)) throw new Error("invalid_response");
     payload.attendance.forEach(row => {
@@ -1400,7 +1598,7 @@ async function sendToSheet() {
     message("Google Sheet-д амжилттай хадгаллаа.", true);
   } catch (error) {
     const errors = {
-      unauthorized: "TOKEN буруу байна. Apps Script-ийн TOKEN болон SHEET_TOKEN ижил эсэхийг шалгана уу.",
+      draft_conflict: "Өөр төхөөрөмжөөс өөрчлөлт орсон байна.",
       invalid_payload: "Илгээсэн мэдээлэл шаардлага хангахгүй байна. Ирцийн нийлбэр, хоцорсон сурагчийн анги болон нэрийг шалгана уу.",
       save_failed: "Apps Script мэдээллийг хадгалж чадсангүй. SPREADSHEET_ID, хүснэгтэд хандах эрх, баганын толгойг шалгана уу. Apps Script-ийн Executions хэсэгт дэлгэрэнгүй алдаа байна.",
       day_changed: "Ирцийн өдөр солигдсон байна. Хуудсыг дахин ачаална уу.",
@@ -1416,6 +1614,7 @@ async function sendToSheet() {
   } finally {
     clearTimeout(timeout);
     sendingAttendance = false;
+    queueSharedDraft();
     button.disabled = false;
     button.textContent = label;
     refreshSharedAttendance();
@@ -1452,6 +1651,7 @@ function resetInputs() {
   calculateTotals();
   validateAttendance();
   localStorage.removeItem(DRAFT_STORAGE_KEY);
+  queueSharedDraft();
 }
 
 /* ================= EXCEL EXPORT ================= */
