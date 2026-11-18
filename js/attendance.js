@@ -25,14 +25,21 @@ document.addEventListener("DOMContentLoaded", async () => {
   initLateStudentRows();
   initLateStudentDropdowns();
   initExportToolbar();
+  initTeacherAccess();
   const sendButton = document.querySelector('[data-action="sheet"]');
   if (sendButton) sendButton.disabled = true;
   initDutySignatures();
   initTeacherTimeControl();
   updateExpectedStudentCounts();
-  const sharedRows = await dailyRequest;
-  sharedAttendanceLoaded = Array.isArray(sharedRows);
-  if (sharedAttendanceLoaded) applySharedAttendance(sharedRows);
+  sectionBaseline = attendanceSections();
+  const emptySections = sectionBaseline;
+  sectionBaseline = { ...sectionBaseline };
+  const snapshot = await dailyRequest;
+  sharedAttendanceLoaded = Boolean(snapshot);
+  if (snapshot) {
+    applySharedAttendance(snapshot);
+    applySharedSections(snapshot);
+  }
   if (!sharedAttendanceLoaded) {
     const status = document.querySelector(".sheet-send-status");
     if (status) {
@@ -41,7 +48,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
   attendanceBaseline = attendanceDraftRows();
-  restoreDraft();
+  restoreDraft(emptySections);
   if (sendButton) sendButton.disabled = !sharedAttendanceLoaded;
   updateExpectedStudentCounts();
   initAttendanceCountControls();
@@ -54,6 +61,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (currentDraftDate() !== activeAttendanceDate) window.location.reload();
   };
   window.setInterval(checkDay, 1000);
+  window.setInterval(refreshSharedAttendance, 15000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshSharedAttendance();
+  });
   document.addEventListener("visibilitychange", checkDay);
   window.addEventListener("pageshow", checkDay);
   checkDay();
@@ -258,6 +269,14 @@ const DRAFT_STORAGE_KEY = `attendance-draft-v${document.body.dataset.shift || "1
 let activeAttendanceDate;
 let attendanceBaseline = {};
 let sharedAttendanceLoaded = false;
+let teacherAccess = false;
+let teacherKey = sessionStorage.getItem("attendance-teacher-key") || "";
+let sectionBaseline;
+const appliedSections = {};
+let refreshingAttendance = false;
+let sendingAttendance = false;
+let submissionVersion = 0;
+const sameValues = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const attendanceDateFormatter = new Intl.DateTimeFormat("en-CA", {
   timeZone: "Asia/Ulaanbaatar", year: "numeric", month: "2-digit", day: "2-digit"
 });
@@ -291,7 +310,7 @@ async function loadDailyAttendance() {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({
-        token: SHEET_TOKEN, action: "dailyAttendance", date: activeAttendanceDate,
+        token: SHEET_TOKEN, teacherKey, action: "dailyAttendance", date: activeAttendanceDate,
         shift: document.body.dataset.shift || "1"
       }),
       signal: controller.signal
@@ -299,7 +318,7 @@ async function loadDailyAttendance() {
     if (!response.ok) throw new Error("http_" + response.status);
     const result = await response.json();
     if (!result.ok || !Array.isArray(result.attendance)) throw new Error(result.error || "invalid_response");
-    return result.attendance;
+    return result;
   } catch (error) {
     console.warn("Shared attendance could not be loaded.", error);
     return null;
@@ -308,15 +327,129 @@ async function loadDailyAttendance() {
   }
 }
 
-function applySharedAttendance(savedRows) {
-  const groups = new Map(savedRows.map(([group, ...values]) => [normaliseGroupName(group), values]));
+function initTeacherAccess() {
+  const status = document.querySelector(".sheet-send-status");
+  if (!status) return;
+  const form = document.createElement("form");
+  const password = document.createElement("input");
+  password.type = "password";
+  password.autocomplete = "current-password";
+  password.placeholder = "Багшийн нэвтрэх код";
+  password.setAttribute("aria-label", password.placeholder);
+  password.required = true;
+  const button = document.createElement("button");
+  button.textContent = "Багшаар нэвтрэх";
+  form.append(password, button);
+  status.after(form);
+  form.addEventListener("submit", async event => {
+    event.preventDefault();
+    teacherKey = password.value.trim();
+    password.value = "";
+    await refreshSharedAttendance();
+  });
+}
+
+async function refreshSharedAttendance() {
+  if (refreshingAttendance || sendingAttendance || currentDraftDate() !== activeAttendanceDate ||
+      !sectionBaseline) return;
+  refreshingAttendance = true;
+  const version = submissionVersion;
+  const key = teacherKey;
+  try {
+    const snapshot = await loadDailyAttendance();
+    if (!snapshot || version !== submissionVersion || key !== teacherKey ||
+        currentDraftDate() !== activeAttendanceDate) return;
+    applySharedAttendance(snapshot, true);
+    applySharedSections(snapshot);
+    sharedAttendanceLoaded = true;
+    const button = document.querySelector('[data-action="sheet"]');
+    if (button) button.disabled = false;
+    calculateTotals();
+    validateAttendance();
+  } finally {
+    refreshingAttendance = false;
+  }
+}
+
+function applySharedAttendance(snapshot, preserveEdits = false) {
+  const local = preserveEdits ? attendanceDraftRows() : {};
+  const groups = new Map(snapshot.attendance.map(([group, ...values]) => [normaliseGroupName(group), values]));
   document.querySelectorAll(".attendance-table tbody tr").forEach(row => {
-    const values = groups.get(normaliseGroupName(row.cells[2]?.textContent));
-    values?.forEach((value, index) => {
+    const group = normaliseGroupName(row.cells[2]?.textContent);
+    const values = groups.get(group);
+    if (!values || (preserveEdits && !sameValues(local[group], attendanceBaseline[group]))) return;
+    values.forEach((value, index) => {
       const input = row.cells[index + 3]?.querySelector("input");
       if (input) input.value = String(value);
     });
+    const names = snapshot.details?.names[group];
+    if (names) [8, 9].forEach((cell, index) => {
+      if (!row.cells[cell].querySelector(".name-multiselect.is-open")) restoreSharedNames(row.cells[cell], names[index]);
+    });
+    if (preserveEdits) {
+      attendanceBaseline[group] = {
+        values: values.map(String),
+        absentNames: selectedNames(row.cells[8]),
+        leaveNames: selectedNames(row.cells[9])
+      };
+    }
   });
+}
+
+function restoreSharedNames(cell, names) {
+  const saved = new Set(String(names || "").split(/,\s*|\n/).filter(Boolean));
+  const inputs = [...cell.querySelectorAll(".name-multiselect input")];
+  const abbreviated = new Map();
+  inputs.forEach(input => {
+    const short = displayStudentName(input.value);
+    abbreviated.set(short, abbreviated.has(short) ? null : input);
+    input.checked = saved.has(input.value);
+  });
+  saved.forEach(name => {
+    const input = abbreviated.get(name);
+    if (input) input.checked = true;
+  });
+  const control = cell.querySelector(".name-multiselect");
+  if (control) updateNameMultiSelect(control);
+}
+
+function applySharedSections(snapshot) {
+  teacherAccess = snapshot.teacherAccess === true;
+  if (teacherKey && !teacherAccess) {
+    teacherKey = "";
+    sessionStorage.removeItem("attendance-teacher-key");
+    const status = document.querySelector(".sheet-send-status");
+    status.textContent = "Багшийн нэвтрэх код тохироогүй байна.";
+    status.dataset.state = "error";
+  }
+  if (!snapshot.details) return;
+  sessionStorage.setItem("attendance-teacher-key", teacherKey);
+  const accessForm = document.querySelector(".sheet-send-status + form");
+  if (accessForm) accessForm.hidden = true;
+  const local = attendanceSections();
+  const details = snapshot.details;
+  const lateGroups = new Map();
+  details.late.forEach(([number, group, name, phone, address]) => {
+    const key = JSON.stringify([number, group, phone, address]);
+    if (!lateGroups.has(key)) lateGroups.set(key, { values: [group, phone, address], studentNames: name });
+    else lateGroups.get(key).studentNames += ", " + name;
+  });
+  const remote = {
+    ...details,
+    elective: details.elective,
+    late: [...lateGroups.values()],
+    dutySignatures: details.dutySignatures || {},
+    teacherTimeControl: details.teacherTimeControl || []
+  };
+  const clean = Object.keys(local).filter(key =>
+    sameValues(local[key], sectionBaseline[key]) && !sameValues(remote[key], appliedSections[key]));
+  restoreDraftSections(remote, new Set(clean), true);
+  const applied = attendanceSections();
+  clean.forEach(key => {
+    sectionBaseline[key] = applied[key];
+    appliedSections[key] = remote[key];
+  });
+  if (clean.includes("late")) refreshLateCounts();
 }
 
 function formControlValues(row) {
@@ -333,21 +466,28 @@ function restoreControlValues(row, values = []) {
     });
 }
 
+function attendanceSections() {
+  return {
+    elective: [...document.querySelectorAll(".elective-table tbody tr")].map(formControlValues),
+    dutyTeacherName: currentDutyTeacherName(),
+    dutyTeacherNotes: document.getElementById("duty-teacher-notes")?.value || "",
+    dutySignatures: Object.fromEntries([...document.querySelectorAll(".duty-signature-input")].map(input => [input.id, input.value])),
+    teacherTimeControl: [...document.querySelectorAll(".teacher-time-table tbody tr")].map(formControlValues),
+    late: [...document.querySelectorAll(".late-students-table tbody tr")].map(row => ({
+      values: formControlValues(row),
+      studentNames: selectedNames(row.cells[2])
+    }))
+  };
+}
+
 function saveDraft() {
   try {
     const draft = {
       date: activeAttendanceDate,
       attendance: attendanceDraftRows(),
       attendanceBaseline,
-      elective: [...document.querySelectorAll(".elective-table tbody tr")].map(formControlValues),
-      dutyTeacherName: currentDutyTeacherName(),
-      dutyTeacherNotes: document.getElementById("duty-teacher-notes")?.value || "",
-      dutySignatures: Object.fromEntries([...document.querySelectorAll(".duty-signature-input")].map(input => [input.id, input.value])),
-      teacherTimeControl: [...document.querySelectorAll(".teacher-time-table tbody tr")].map(formControlValues),
-      late: [...document.querySelectorAll(".late-students-table tbody tr")].map(row => ({
-        values: formControlValues(row),
-        studentNames: selectedNames(row.cells[2])
-      }))
+      sectionBaseline,
+      ...attendanceSections()
     };
     localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
   } catch (error) {
@@ -355,7 +495,7 @@ function saveDraft() {
   }
 }
 
-function restoreDraft() {
+function restoreDraft(emptySections) {
   try {
     const rawDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
     if (!rawDraft) return;
@@ -389,6 +529,20 @@ function restoreDraft() {
       });
     });
 
+    const edited = new Set(Object.keys(attendanceSections()).filter(key =>
+      !teacherAccess || (draft.sectionBaseline
+        ? !sameValues(draft[key], draft.sectionBaseline[key])
+        : draft[key] !== undefined && !sameValues(draft[key], emptySections[key]))));
+    restoreDraftSections(draft, edited);
+  } catch (error) {
+    console.warn("Attendance draft could not be restored.", error);
+  } finally {
+    validateAttendance();
+  }
+}
+
+function restoreDraftSections(draft, keys, shared = false) {
+  if (keys.has("elective")) {
     const savedElectives = Array.isArray(draft.elective) ? [...draft.elective] : [];
     while (savedElectives.length > 3 && !savedElectives.at(-1)?.some(value => String(value || "").trim() && String(value) !== "0")) {
       savedElectives.pop();
@@ -396,12 +550,14 @@ function restoreDraft() {
     const electiveTable = document.querySelector(".elective-table");
     while (electiveTable && electiveTable.tBodies[0].rows.length < savedElectives.length) electiveTable.addElectiveRow();
     [...document.querySelectorAll(".elective-table tbody tr")]
-      .forEach((row, index) => restoreControlValues(row, draft.elective?.[index]));
+      .forEach((row, index) => restoreControlValues(row, draft.elective?.[index] || (shared ? ["", "", "", "0", "0", "0", ""] : [])));
 
-    const dutyTeacherName = document.getElementById("duty-teacher-name");
-    if (dutyTeacherName) dutyTeacherName.value = draft.dutyTeacherName || "";
-    const dutyTeacherNotes = document.getElementById("duty-teacher-notes");
-    if (dutyTeacherNotes) dutyTeacherNotes.value = draft.dutyTeacherNotes || "";
+  }
+  const dutyTeacherName = document.getElementById("duty-teacher-name");
+  if (keys.has("dutyTeacherName") && dutyTeacherName) dutyTeacherName.value = draft.dutyTeacherName || "";
+  const dutyTeacherNotes = document.getElementById("duty-teacher-notes");
+  if (keys.has("dutyTeacherNotes") && dutyTeacherNotes) dutyTeacherNotes.value = draft.dutyTeacherNotes || "";
+  if (keys.has("teacherTimeControl")) {
     const savedTimeRows = Array.isArray(draft.teacherTimeControl) ? [...draft.teacherTimeControl] : [];
     // Older drafts included five rows even when the last three were empty.
     while (savedTimeRows.length > 2 && !savedTimeRows.at(-1)?.some(value => String(value || "").trim())) {
@@ -411,16 +567,18 @@ function restoreDraft() {
       document.querySelector(".teacher-time-table").addTimeRow();
     }
     document.querySelectorAll(".teacher-time-table tbody tr").forEach((row, index) => {
-      restoreControlValues(row, savedTimeRows[index]);
+      restoreControlValues(row, savedTimeRows[index] || (shared ? ["", "", "", ""] : []));
     });
-    document.querySelectorAll(".duty-signature-input").forEach(input => {
-      input.value = draft.dutySignatures?.[input.id] || "";
-    });
-    const completedTeacher = document.getElementById("completed-duty-teacher");
-    if (completedTeacher && !draft.dutySignatures?.["completed-duty-teacher"] && draft.dutyTeacherName) {
-      completedTeacher.value = draft.dutyTeacherName;
-    }
+  }
+  if (keys.has("dutySignatures")) document.querySelectorAll(".duty-signature-input").forEach(input => {
+    input.value = draft.dutySignatures?.[input.id] || "";
+  });
+  const completedTeacher = document.getElementById("completed-duty-teacher");
+  if (keys.has("dutyTeacherName") && completedTeacher && !draft.dutySignatures?.["completed-duty-teacher"] && draft.dutyTeacherName) {
+    completedTeacher.value = draft.dutyTeacherName;
+  }
 
+  if (keys.has("late")) {
     const savedLateRows = Array.isArray(draft.late) ? [...draft.late] : [];
     while (savedLateRows.length > 3) {
       const last = savedLateRows.at(-1);
@@ -431,7 +589,7 @@ function restoreDraft() {
     const lateTable = document.querySelector(".late-students-table");
     while (lateTable && lateTable.tBodies[0].rows.length < savedLateRows.length) lateTable.addLateRow();
     [...document.querySelectorAll(".late-students-table tbody tr")].forEach((row, index) => {
-      const savedRow = draft.late?.[index];
+      const savedRow = draft.late?.[index] || (shared ? { values: ["", "", ""] } : null);
       if (!savedRow) return;
       const values = Array.isArray(savedRow) ? savedRow : savedRow.values;
       const classSelect = row.querySelector(".late-class-select");
@@ -440,17 +598,8 @@ function restoreDraft() {
         classSelect.dispatchEvent(new Event("change"));
       }
       restoreControlValues(row, values);
-      const selected = new Set(String(savedRow.studentNames || "").split(", ").filter(Boolean));
-      row.cells[2]?.querySelectorAll(".name-multiselect input").forEach(input => {
-        input.checked = selected.has(input.value);
-      });
-      const control = row.cells[2]?.querySelector(".name-multiselect");
-      if (control) updateNameMultiSelect(control);
+      restoreSharedNames(row.cells[2], savedRow.studentNames);
     });
-  } catch (error) {
-    console.warn("Attendance draft could not be restored.", error);
-  } finally {
-    validateAttendance();
   }
 }
 
@@ -1200,7 +1349,20 @@ async function sendToSheet() {
     if (!window.confirm(review)) return;
   }
   const submittedRows = attendanceDraftRows();
+  const sections = attendanceSections();
   const payload = buildSheetPayload(submittedRows);
+  payload.teacherKey = teacherKey;
+  if (sameValues(sections.elective, sectionBaseline.elective)) payload.electives = [];
+  if (sameValues(sections.late, sectionBaseline.late)) payload.late = [];
+  const { dutyTeacherNotes, dutySignatures, teacherTimeControl } = sections;
+  if (["dutyTeacherNotes", "dutySignatures", "teacherTimeControl"].some(key => !sameValues(sections[key], sectionBaseline[key]))) {
+    if (teacherAccess) payload.dutyForm = { dutyTeacherNotes, dutySignatures, teacherTimeControl };
+  } else {
+    payload.teacher = "";
+    payload.notes = "";
+  }
+  sendingAttendance = true;
+  submissionVersion++;
   const label = button.textContent;
   button.disabled = true;
   button.textContent = "Илгээж байна...";
@@ -1228,6 +1390,8 @@ async function sendToSheet() {
       const group = normaliseGroupName(row[2]);
       attendanceBaseline[group] = submittedRows[group];
     });
+    sectionBaseline = sections;
+    Object.keys(appliedSections).forEach(key => { delete appliedSections[key]; });
     saveDraft();
     if (result.lateCounts) {
       yearlyLateHistory = result.lateCounts;
@@ -1252,8 +1416,10 @@ async function sendToSheet() {
     message(`${detail} Ноорог хадгалагдсан.`);
   } finally {
     clearTimeout(timeout);
+    sendingAttendance = false;
     button.disabled = false;
     button.textContent = label;
+    refreshSharedAttendance();
   }
 }
 
