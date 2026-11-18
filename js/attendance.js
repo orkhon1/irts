@@ -15,6 +15,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   initShiftLabels();
   activeAttendanceDate = currentDraftDate();
   updateCurrentDate();
+  initDraftStatus();
+  showDraftStatus("Өнөөдрийн нооргийг уншиж байна. Түр хүлээнэ үү…");
   const dailyRequest = loadDailyAttendance();
   await loadClassRosters();
   initElectiveRows();
@@ -24,7 +26,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   initLateStudentRows();
   initLateStudentDropdowns();
   initExportToolbar();
-  initDraftStatus();
   initSaverName();
   const sendButton = document.querySelector('[data-action="sheet"]');
   if (sendButton) sendButton.disabled = true;
@@ -40,13 +41,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     applySharedAttendance(snapshot);
     applySharedSections(snapshot);
   }
-  if (!sharedAttendanceLoaded) {
-    const status = document.querySelector(".sheet-send-status");
-    if (status) {
-      status.textContent = "Өмнө илгээсэн ирцийг ачаалж чадсангүй. Дахин ачаалж шалгана уу.";
-      status.dataset.state = "error";
-    }
-  }
+  if (!snapshot) showDraftStatus("Нооргийг уншиж чадсангүй. Автоматаар дахин оролдоно.");
   attendanceBaseline = attendanceDraftRows();
   if (!receiveSharedDraft(snapshot)) restoreDraft(emptySections);
   const saverInput = document.getElementById("duty-teacher-name");
@@ -383,11 +378,15 @@ async function refreshSharedAttendance() {
   if (refreshingAttendance || sendingAttendance || currentDraftDate() !== activeAttendanceDate ||
       !sectionBaseline) return;
   refreshingAttendance = true;
+  if (!sharedAttendanceLoaded) showDraftStatus("Өнөөдрийн нооргийг дахин уншиж байна. Түр хүлээнэ үү…");
   const version = submissionVersion;
   try {
     const snapshot = await loadDailyAttendance();
-    if (!snapshot || version !== submissionVersion ||
-        currentDraftDate() !== activeAttendanceDate) return;
+    if (version !== submissionVersion || currentDraftDate() !== activeAttendanceDate) return;
+    if (!snapshot) {
+      if (!sharedAttendanceLoaded) showDraftStatus("Нооргийг уншиж чадсангүй. Автоматаар дахин оролдоно.");
+      return;
+    }
     const cleanBeforeRefresh = draftBaseline !== undefined && sameValues(sharedDraftForm(), draftBaseline);
     if (!snapshot.sharedDraft) applySharedAttendance(snapshot, true);
     applySharedSections(snapshot, !snapshot.sharedDraft);
@@ -535,7 +534,11 @@ function receiveSharedDraft(snapshot) {
   if (!remote) {
     if (draftBaseline === undefined) {
       draftBaseline = { attendance: { ...attendanceBaseline }, ...sectionBaseline };
-      showDraftStatus("Төхөөрөмж хооронд хадгалах горим идэвхтэй.");
+      const hasSavedReport = snapshot.attendance.length || snapshot.details?.elective?.length ||
+        snapshot.details?.late?.length || snapshot.details?.dutyTeacherNotes || snapshot.details?.dutyTeacherName;
+      showDraftStatus(hasSavedReport
+        ? "Өнөөдрийн илгээсэн бүртгэлийг ачааллаа."
+        : "Өнөөдрийн шинэ бүртгэл бэлэн. Та бөглөж эхэлж болно.");
     }
     return false;
   }
@@ -551,7 +554,7 @@ function receiveSharedDraft(snapshot) {
   reloadConflictingDraft = false;
   draftRevision = remote.revision;
   draftBaseline = sharedDraftForm();
-  showLastDraftSave(remote);
+  showLastDraftSave(remote, "Хадгалсан нооргийг ачааллаа.");
   if (acceptedConflict) saveDraft();
   if (initialLoad) {
     try {
@@ -584,12 +587,15 @@ function restoreSharedDraftForm(form) {
   refreshLateCounts();
 }
 
-function showLastDraftSave(draft) {
+function showLastDraftSave(draft, loadedMessage = "") {
   const time = draft.updated_at && new Date(draft.updated_at);
   const formatted = time && !Number.isNaN(time.getTime()) ? new Intl.DateTimeFormat("mn-MN", {
     timeZone: "Asia/Ulaanbaatar", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
   }).format(time) : "";
-  showDraftStatus(formatted ? `Сүүлд хадгалсан: ${formatted}, ${draft.updated_by || "Тодорхойгүй"}` : "Ноорог хадгалагдсан.");
+  const savedMessage = formatted
+    ? `Сүүлд хадгалсан: ${formatted}, ${draft.updated_by || "Тодорхойгүй"}`
+    : "Ноорог хадгалагдсан.";
+  showDraftStatus([loadedMessage, savedMessage].filter(Boolean).join(" "));
 }
 
 function askToRefreshDraft() {
