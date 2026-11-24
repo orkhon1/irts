@@ -1038,14 +1038,22 @@ body.admin { border-top: 6px solid #2b6cb0; }
 .attendance-backfill form {
     display: flex;
     align-items: center;
+    justify-content: center;
     flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 8px;
+    gap: 10px;
+    margin: 0;
 }
 .attendance-backfill input {
-    padding: 7px 9px;
+    min-height: 46px;
+    padding: 8px 12px;
     border: 1px solid #ccc;
-    border-radius: 8px;
+    border-radius: 10px;
+    color: inherit;
+    background: #fff;
     font: inherit;
+}
+.attendance-backfill form .toolbar-btn {
+    min-height: 40px;
+    font-size: 1rem;
 }
 @media print { .attendance-backfill { display: none; } }
