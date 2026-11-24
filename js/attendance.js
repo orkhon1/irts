@@ -15,7 +15,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   initShiftLabels();
   openedAttendanceDay = currentDraftDate();
   const requestedDate = new URLSearchParams(window.location.search).get("date");
-  if (requestedDate === previousAttendanceDate()) backfillAttendance = true;
+  backfillAttendance = isBackfillDate(requestedDate, openedAttendanceDay);
   activeAttendanceDate = backfillAttendance ? requestedDate : openedAttendanceDay;
   if (backfillAttendance) {
     const shiftLink = document.querySelector(".shift-toggle");
@@ -23,7 +23,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
   updateCurrentDate();
   initDraftStatus();
-  showDraftStatus(backfillAttendance ? "Өмнөх өдрийн бүртгэлийг уншиж байна…" : "Өнөөдрийн нооргийг уншиж байна. Түр хүлээнэ үү…");
+  showDraftStatus(backfillAttendance ? "Сонгосон өдрийн бүртгэлийг уншиж байна…" : "Өнөөдрийн нооргийг уншиж байна. Түр хүлээнэ үү…");
   const dailyRequest = loadDailyAttendance();
   await loadClassRosters();
   initElectiveRows();
@@ -33,6 +33,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   initLateStudentRows();
   initLateStudentDropdowns();
   initExportToolbar();
+  initBackfillPicker();
   initSaverName();
   const sendButton = document.querySelector('[data-action="sheet"]');
   if (sendButton) sendButton.disabled = true;
@@ -225,7 +226,7 @@ function updateCurrentDate() {
   if (!dateLine) return;
 
   const [year, month, day] = activeAttendanceDate.split("-").map(Number);
-  dateLine.textContent = `${backfillAttendance ? "Өмнөх өдрийн ирц · " : ""}${year} оны ${month} сарын ${day}-ны өдөр`;
+  dateLine.textContent = `${backfillAttendance ? "Нөхөж бөглөх ирц · " : ""}${year} оны ${month} сарын ${day}-ны өдөр`;
 }
 
 /* Presentation only: preserve cell order and the existing form controls. */
@@ -278,7 +279,24 @@ let openedAttendanceDay;
 let backfillAttendance = false;
 
 function draftStorageKey() {
-  return backfillAttendance ? todayDraftStorageKey + "-backfill" : todayDraftStorageKey;
+  return backfillAttendance ? todayDraftStorageKey + "-backfill-" + activeAttendanceDate : todayDraftStorageKey;
+}
+
+function isBackfillDate(date, today) {
+  if (!date || !/^[1-9]\d{3}-\d{2}-\d{2}$/.test(date) || date >= today) return false;
+  const parsed = new Date(date + "T00:00:00Z");
+  return !isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+}
+
+function readLocalDraft() {
+  const stored = localStorage.getItem(draftStorageKey());
+  if (stored || !backfillAttendance) return stored;
+  const legacyKey = todayDraftStorageKey + "-backfill";
+  const legacy = localStorage.getItem(legacyKey);
+  if (!legacy || JSON.parse(legacy)?.date !== activeAttendanceDate) return null;
+  localStorage.setItem(draftStorageKey(), legacy);
+  localStorage.removeItem(legacyKey);
+  return legacy;
 }
 
 function previousAttendanceDate() {
@@ -579,7 +597,7 @@ function receiveSharedDraft(snapshot) {
   if (acceptedConflict) saveDraft();
   if (initialLoad) {
     try {
-      const local = JSON.parse(localStorage.getItem(draftStorageKey()));
+      const local = JSON.parse(readLocalDraft());
       if (local?.date === activeAttendanceDate && local.pendingSync && local.draftRevision === draftRevision) {
         restoreSharedDraftForm(reconcileLegacyDutyDraft(local, remote.form));
       }
@@ -734,7 +752,7 @@ async function flushSharedDraft() {
 
 function restoreDraft(emptySections) {
   try {
-    const rawDraft = localStorage.getItem(draftStorageKey());
+    const rawDraft = readLocalDraft();
     if (!rawDraft) return;
     const draft = JSON.parse(rawDraft);
     if (!draft || draft.date !== activeAttendanceDate || !draft.attendance ||
@@ -1491,12 +1509,6 @@ function initExportToolbar() {
     toolbar.append(hint);
   }
 
-  const dateLink = document.createElement("a");
-  dateLink.className = "toolbar-btn";
-  dateLink.href = backfillAttendance ? window.location.pathname : "?date=" + previousAttendanceDate();
-  dateLink.textContent = backfillAttendance ? "Өнөөдрийн ирц рүү буцах" : "Өмнөх өдрийн ирц нөхөх";
-  toolbar.insertBefore(dateLink, toolbar.querySelector(".submission-hint"));
-
   toolbar.addEventListener("click", e => {
     const btn = e.target.closest("button");
     if (!btn) return;
@@ -1509,6 +1521,44 @@ function initExportToolbar() {
     if (action === "sheet")  sendToSheet();
     if (action === "exit")   resetInputs(); // 🧹 цэвэрлэх
   });
+}
+
+function initBackfillPicker() {
+  const toolbar = document.querySelector(".export-toolbar");
+  if (!toolbar) return;
+  const panel = document.createElement("div");
+  panel.className = "attendance-backfill";
+  const picker = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.className = "toolbar-btn";
+  summary.textContent = "Ирц нөхөж бөглөх";
+  const form = document.createElement("form");
+  const label = document.createElement("label");
+  const input = document.createElement("input");
+  input.id = "attendance-backfill-date";
+  input.name = "date";
+  input.type = "date";
+  input.required = true;
+  input.min = "1000-01-01";
+  input.max = previousAttendanceDate();
+  input.value = backfillAttendance ? activeAttendanceDate : input.max;
+  label.htmlFor = input.id;
+  label.textContent = "Огноо";
+  const submit = document.createElement("button");
+  submit.className = "toolbar-btn";
+  submit.type = "submit";
+  submit.textContent = "Нээх";
+  form.append(label, input, submit);
+  picker.append(summary, form);
+  panel.append(picker);
+  if (backfillAttendance) {
+    const today = document.createElement("a");
+    today.className = "toolbar-btn";
+    today.href = window.location.pathname;
+    today.textContent = "Өнөөдрийн ирц рүү буцах";
+    panel.append(today);
+  }
+  toolbar.after(panel);
 }
 
 /* ================= GOOGLE SHEETS ================= */
