@@ -13,10 +13,17 @@ const SHEET_URL = "https://script.google.com/macros/s/AKfycbx4yo_NMIjqVB9fRBDGpR
 /* ================= DOM READY ================= */
 document.addEventListener("DOMContentLoaded", async () => {
   initShiftLabels();
-  activeAttendanceDate = currentDraftDate();
+  openedAttendanceDay = currentDraftDate();
+  const requestedDate = new URLSearchParams(window.location.search).get("date");
+  if (requestedDate === previousAttendanceDate()) backfillAttendance = true;
+  activeAttendanceDate = backfillAttendance ? requestedDate : openedAttendanceDay;
+  if (backfillAttendance) {
+    const shiftLink = document.querySelector(".shift-toggle");
+    if (shiftLink) shiftLink.href = shiftLink.getAttribute("href") + "?date=" + activeAttendanceDate;
+  }
   updateCurrentDate();
   initDraftStatus();
-  showDraftStatus("Өнөөдрийн нооргийг уншиж байна. Түр хүлээнэ үү…");
+  showDraftStatus(backfillAttendance ? "Өмнөх өдрийн бүртгэлийг уншиж байна…" : "Өнөөдрийн нооргийг уншиж байна. Түр хүлээнэ үү…");
   const dailyRequest = loadDailyAttendance();
   await loadClassRosters();
   initElectiveRows();
@@ -57,7 +64,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   validateAttendance();
   initYearlyLateCounts();
   const checkDay = () => {
-    if (currentDraftDate() !== activeAttendanceDate) window.location.reload();
+    if (currentDraftDate() !== openedAttendanceDay) window.location.reload();
   };
   window.setInterval(checkDay, 1000);
   window.setInterval(refreshSharedAttendance, 25000);
@@ -218,7 +225,7 @@ function updateCurrentDate() {
   if (!dateLine) return;
 
   const [year, month, day] = activeAttendanceDate.split("-").map(Number);
-  dateLine.textContent = `${year} оны ${month} сарын ${day}-ны өдөр`;
+  dateLine.textContent = `${backfillAttendance ? "Өмнөх өдрийн ирц · " : ""}${year} оны ${month} сарын ${day}-ны өдөр`;
 }
 
 /* Presentation only: preserve cell order and the existing form controls. */
@@ -266,7 +273,17 @@ function initMobileInputs() {
 }
 
 /* ================= REFRESH-SAFE DRAFT ================= */
-const DRAFT_STORAGE_KEY = `attendance-draft-v${document.body.dataset.shift || "1"}`;
+const todayDraftStorageKey = `attendance-draft-v${document.body.dataset.shift || "1"}`;
+let openedAttendanceDay;
+let backfillAttendance = false;
+
+function draftStorageKey() {
+  return backfillAttendance ? todayDraftStorageKey + "-backfill" : todayDraftStorageKey;
+}
+
+function previousAttendanceDate() {
+  return currentDraftDate(new Date(Date.now() - 24 * 60 * 60 * 1000));
+}
 
 let activeAttendanceDate;
 let attendanceBaseline = {};
@@ -309,6 +326,8 @@ function attendanceDraftRows() {
     .filter(row => normaliseGroupName(row.cells[2]?.textContent))
     .map(row => [normaliseGroupName(row.cells[2]?.textContent), {
       values: [3, 4, 5, 6, 7].map(index => row.cells[index]?.querySelector("input")?.value || ""),
+      rowNumber: row.cells[0].textContent.trim(),
+      room: row.cells[1].textContent.trim(),
       absentNames: selectedNames(row.cells[8]),
       leaveNames: selectedNames(row.cells[9])
     }]));
@@ -327,7 +346,7 @@ async function loadDailyAttendance() {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({
-        action: "dailyAttendance", date: activeAttendanceDate,
+        action: "dailyAttendance", date: activeAttendanceDate, backfill: backfillAttendance,
         shift: document.body.dataset.shift || "1"
       }),
       signal: controller.signal
@@ -375,14 +394,14 @@ function initSaverName() {
 }
 
 async function refreshSharedAttendance() {
-  if (refreshingAttendance || sendingAttendance || currentDraftDate() !== activeAttendanceDate ||
+  if (refreshingAttendance || sendingAttendance || currentDraftDate() !== openedAttendanceDay ||
       !sectionBaseline) return;
   refreshingAttendance = true;
-  if (!sharedAttendanceLoaded) showDraftStatus("Өнөөдрийн нооргийг дахин уншиж байна. Түр хүлээнэ үү…");
+  if (!sharedAttendanceLoaded) showDraftStatus("Нооргийг дахин уншиж байна. Түр хүлээнэ үү…");
   const version = submissionVersion;
   try {
     const snapshot = await loadDailyAttendance();
-    if (version !== submissionVersion || currentDraftDate() !== activeAttendanceDate) return;
+    if (version !== submissionVersion || currentDraftDate() !== openedAttendanceDay) return;
     if (!snapshot) {
       if (!sharedAttendanceLoaded) showDraftStatus("Нооргийг уншиж чадсангүй. Автоматаар дахин оролдоно.");
       return;
@@ -421,6 +440,8 @@ function applySharedAttendance(snapshot, preserveEdits = false) {
     if (preserveEdits) {
       attendanceBaseline[group] = {
         values: values.map(String),
+        rowNumber: row.cells[0].textContent.trim(),
+        room: row.cells[1].textContent.trim(),
         absentNames: selectedNames(row.cells[8]),
         leaveNames: selectedNames(row.cells[9])
       };
@@ -512,7 +533,7 @@ function saveDraft() {
       attendanceBaseline,
       sectionBaseline
     };
-    localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft));
+    localStorage.setItem(draftStorageKey(), JSON.stringify(draft));
     queueSharedDraft();
   } catch (error) {
     console.warn("Attendance draft could not be saved.", error);
@@ -537,8 +558,8 @@ function receiveSharedDraft(snapshot) {
       const hasSavedReport = snapshot.attendance.length || snapshot.details?.elective?.length ||
         snapshot.details?.late?.length || snapshot.details?.dutyTeacherNotes || snapshot.details?.dutyTeacherName;
       showDraftStatus(hasSavedReport
-        ? "Өнөөдрийн илгээсэн бүртгэлийг ачааллаа."
-        : "Өнөөдрийн шинэ бүртгэл бэлэн. Та бөглөж эхэлж болно.");
+        ? "Илгээсэн бүртгэлийг ачааллаа."
+        : "Бүртгэл бэлэн. Та бөглөж эхэлж болно.");
     }
     return false;
   }
@@ -558,15 +579,50 @@ function receiveSharedDraft(snapshot) {
   if (acceptedConflict) saveDraft();
   if (initialLoad) {
     try {
-      const local = JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY));
+      const local = JSON.parse(localStorage.getItem(draftStorageKey()));
       if (local?.date === activeAttendanceDate && local.pendingSync && local.draftRevision === draftRevision) {
-        restoreSharedDraftForm(local);
+        restoreSharedDraftForm(reconcileLegacyDutyDraft(local, remote.form));
       }
     } catch (error) {
       console.warn("Local draft recovery failed.", error);
     }
   }
   return true;
+}
+
+function reconcileLegacyDutyDraft(local, remote) {
+  const normalized = { ...local, dutySignatures: { ...local.dutySignatures } };
+  const columns = ["Хоцорсон", "Өвчтэй", "Чөлөөтэй", "Шалтгаангүй"];
+  const rows = (remote.teacherTimeControl || [])
+    .map(row => row.map((value, index) => value.trim() ? columns[index] + ": " + value.trim() : "")
+      .filter(Boolean).join("; "))
+    .filter(Boolean);
+  const lines = String(local.dutyTeacherNotes || "").split(/\r?\n/);
+  const heading = "Багш нарын хичээлийн цаг ашиглалтанд тавих хяналт";
+  if (rows.length && lines[0]?.trim() === heading &&
+      rows.every((row, index) => lines[index + 1]?.trim() === row)) {
+    lines.splice(0, rows.length + 1);
+    if (!local.teacherTimeControl?.some(row => row.some(value => value.trim()))) {
+      normalized.teacherTimeControl = remote.teacherTimeControl;
+    }
+  }
+  const labels = {
+    "general-duty-teacher": "Жижүүр багшийн ажилтай танилцсан: Ерөнхий жижүүр",
+    "completed-duty-teacher": "Жижүүр хийсэн багш",
+    "next-duty-teacher": "Дараагийн жижүүр"
+  };
+  while (lines.length) {
+    const last = lines.length - 1;
+    const id = Object.keys(labels).find(key => {
+      const name = remote.dutySignatures?.[key];
+      return name && lines[last].trim() === labels[key] + ": " + name;
+    });
+    if (!id) break;
+    normalized.dutySignatures[id] ||= remote.dutySignatures[id];
+    lines.pop();
+  }
+  normalized.dutyTeacherNotes = lines.join("\n");
+  return normalized;
 }
 
 function restoreSharedDraftForm(form) {
@@ -620,7 +676,7 @@ function queueSharedDraft(delay = 450) {
 async function flushSharedDraft() {
   clearTimeout(draftTimer);
   if (draftConflict || draftWriting || sendingAttendance || draftBaseline === undefined ||
-      currentDraftDate() !== activeAttendanceDate) return;
+      currentDraftDate() !== openedAttendanceDay) return;
   const form = sharedDraftForm();
   if (sameValues(form, draftBaseline) || sameValues(form, rejectedEmptyForm)) return;
   if (Date.now() < nextDraftAttempt) { queueSharedDraft(0); return; }
@@ -628,7 +684,7 @@ async function flushSharedDraft() {
   draftWriting = true;
   showDraftStatus("Ноорог хадгалж байна…");
   const body = JSON.stringify({
-    action: "saveSharedDraft", date: activeAttendanceDate,
+    action: "saveSharedDraft", date: activeAttendanceDate, backfill: backfillAttendance,
     shift: document.body.dataset.shift || "1", revision: draftRevision, form, deviceId,
     updated_by: form.dutyTeacherName, confirmEmpty
   });
@@ -678,12 +734,12 @@ async function flushSharedDraft() {
 
 function restoreDraft(emptySections) {
   try {
-    const rawDraft = localStorage.getItem(DRAFT_STORAGE_KEY);
+    const rawDraft = localStorage.getItem(draftStorageKey());
     if (!rawDraft) return;
     const draft = JSON.parse(rawDraft);
     if (!draft || draft.date !== activeAttendanceDate || !draft.attendance ||
         typeof draft.attendance !== "object" || Array.isArray(draft.attendance)) {
-      localStorage.removeItem(DRAFT_STORAGE_KEY);
+      localStorage.removeItem(draftStorageKey());
       return;
     }
 
@@ -1098,7 +1154,7 @@ async function initYearlyLateCounts() {
   try {
     const response = await fetch(SHEET_URL, {
       method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action: "lateHistory", date: currentDraftDate() }),
+      body: JSON.stringify({ action: "lateHistory", date: activeAttendanceDate }),
       signal: AbortSignal.timeout(30000)
     });
     const result = await response.json();
@@ -1156,8 +1212,10 @@ function initLateStudentRows() {
 /* ================= LATE STUDENT DROPDOWNS ================= */
 function initLateStudentDropdowns(root = document) {
   const shift = document.body.dataset.shift || "1";
+  const attendanceGroups = new Set([...document.querySelectorAll(".attendance-table tbody tr")]
+    .map(row => normaliseGroupName(row.cells[2]?.textContent)).filter(Boolean));
   const classGroups = Object.keys(CLASS_ROSTERS)
-    .filter(group => CLASS_SHIFTS[group] === `${shift}-р ээлж`);
+    .filter(group => CLASS_SHIFTS[group] === `${shift}-р ээлж` || attendanceGroups.has(group));
 
   const rows = root.matches?.("tr") ? [root] : root.querySelectorAll(".late-students-table tbody tr");
   rows.forEach(row => {
@@ -1433,6 +1491,12 @@ function initExportToolbar() {
     toolbar.append(hint);
   }
 
+  const dateLink = document.createElement("a");
+  dateLink.className = "toolbar-btn";
+  dateLink.href = backfillAttendance ? window.location.pathname : "?date=" + previousAttendanceDate();
+  dateLink.textContent = backfillAttendance ? "Өнөөдрийн ирц рүү буцах" : "Өмнөх өдрийн ирц нөхөх";
+  toolbar.insertBefore(dateLink, toolbar.querySelector(".submission-hint"));
+
   toolbar.addEventListener("click", e => {
     const btn = e.target.closest("button");
     if (!btn) return;
@@ -1460,6 +1524,7 @@ function buildSheetPayload(draftRows = attendanceDraftRows()) {
   return {
     action: "mergeAttendance",
     date: activeAttendanceDate,
+    backfill: backfillAttendance,
     shift: document.body.dataset.shift || "1",
     teacher: currentDutyTeacherName(),
     notes: dutyNotesWithSignatures(),
@@ -1485,7 +1550,7 @@ async function sendToSheet() {
     status.textContent = draftConflict ? "Өөр төхөөрөмжөөс өөрчлөлт орсон байна." : "Ноорог хадгалагдаж байна. Түр хүлээнэ үү.";
     return;
   }
-  if (currentDraftDate() !== activeAttendanceDate) {
+  if (currentDraftDate() !== openedAttendanceDay) {
     window.location.reload();
     return;
   }
@@ -1528,7 +1593,7 @@ async function sendToSheet() {
     const remaining = classes.length - completed;
     const review = [
       "Ирцийн мэдээг илгээх үү?",
-      `${shiftDisplayName()} · ${currentDraftDate()}`,
+      `${shiftDisplayName()} · ${activeAttendanceDate}`,
       `Жижүүр багш: ${currentDutyTeacherName() || "Нэр оруулаагүй"}`,
       `Бөглөсөн анги: ${completed} / ${classes.length}`,
       remaining ? `Анхаар: ${remaining} ангийн ирсэн сурагчийн тоог бөглөөгүй байна.` : "",
@@ -1656,7 +1721,7 @@ function resetInputs() {
   updateExpectedStudentCounts(true);
   calculateTotals();
   validateAttendance();
-  localStorage.removeItem(DRAFT_STORAGE_KEY);
+  localStorage.removeItem(draftStorageKey());
   queueSharedDraft();
 }
 
@@ -1670,7 +1735,7 @@ function exportExcel(download = true) {
   const title = "2026-2027 оны хичээлийн жилийн сурагчдын ирцийн тэмдэглэл";
   const headers = ["№","Анги №","Анги бүлэг","Ирэх","Ирсэн","Өвчтэй","Чөлөөтэй","Тасалсан","Тасалсан","Чөлөө"];
   const shift = document.body.dataset.shift || "1";
-  const dateStamp = currentDraftDate();
+  const dateStamp = activeAttendanceDate;
   const dutyTeacherName = currentDutyTeacherName();
   const data = [[title], [`${shiftDisplayName(shift)} · ${dateStamp}`], [`Жижүүр багшийн нэр: ${dutyTeacherName}`], headers];
 
@@ -1742,7 +1807,7 @@ function exportToGmail() {
   if (!exportExcel()) return;
 
   const shift = document.body.dataset.shift || "1";
-  const dateStamp = currentDraftDate();
+  const dateStamp = activeAttendanceDate;
   const dutyTeacherName = currentDutyTeacherName();
   const composeUrl = new URL("https://mail.google.com/mail/");
   composeUrl.searchParams.set("view", "cm");
