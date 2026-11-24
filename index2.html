@@ -7,7 +7,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#2b6cb0">
     <title>2026-2027 оны хичээлийн жилийн сурагчдын ирцийн тэмдэглэл</title>
-    <link rel="stylesheet" href="css/styles.css?v=20261124-backfill-date">
+    <link rel="stylesheet" href="css/styles.css?v=20261124-backfill-button">
 </head>
 <!-- Excel -->
 <script src="js/vendor/xlsx.full.min.js"></script>
@@ -32,7 +32,7 @@
             <div class="export-toolbar" role="toolbar" aria-label="Экспортын товчнууд">
                 <div class="mobile-export-actions">
                   <button type="button" class="toolbar-btn sheet-send-button" data-action="sheet">Sheet-д илгээх</button>
-                <button type="button" class="toolbar-btn" data-action="gmail">📧 Gmail/Ирцийн мэдээлэл илгээх</button>
+                <button type="button" class="toolbar-btn" data-action="backfill" aria-controls="attendance-backfill-panel" aria-expanded="false">Ирц нөхөж бөглөх</button>
   <button type="button" class="toolbar-btn" data-action="excel">📥 Excel</button>
   <button type="button" class="toolbar-btn" data-action="pdf">� PDF</button>
   </div>
@@ -430,7 +430,7 @@
             <textarea id="duty-teacher-notes" rows="4" aria-label="Жижүүр багшийн тэмдэглэл"></textarea>
         </section>
     </div>
-    <script src="js/attendance.js?v=20261124-backfill-date" defer></script>
+    <script src="js/attendance.js?v=20261124-backfill-button" defer></script>
 </body>
 </html>
 
