@@ -1499,9 +1499,6 @@ function initExportToolbar() {
   document.querySelectorAll('[data-action="sheet"]').forEach(button => {
     button.textContent = "Ирцийн мэдээ илгээх";
   });
-  document.querySelectorAll('[data-action="gmail"]').forEach(button => {
-    button.textContent = "📧 Gmail";
-  });
   if (!toolbar.querySelector(".submission-hint")) {
     const hint = document.createElement("p");
     hint.className = "submission-hint";
@@ -1516,7 +1513,6 @@ function initExportToolbar() {
     const action = btn.dataset.action;
 
     if (action === "excel")  exportExcel();
-    if (action === "gmail")  exportToGmail();
     if (action === "pdf")    exportPDF();
     if (action === "sheet")  sendToSheet();
     if (action === "exit")   resetInputs(); // 🧹 цэвэрлэх
@@ -1526,12 +1522,16 @@ function initExportToolbar() {
 function initBackfillPicker() {
   const toolbar = document.querySelector(".export-toolbar");
   if (!toolbar) return;
+  const button = toolbar.querySelector('[data-action="backfill"], [data-action="gmail"]');
+  if (!button) return;
+  button.dataset.action = "backfill";
+  button.textContent = "Ирц нөхөж бөглөх";
   const panel = document.createElement("div");
   panel.className = "attendance-backfill";
-  const picker = document.createElement("details");
-  const summary = document.createElement("summary");
-  summary.className = "toolbar-btn";
-  summary.textContent = "Ирц нөхөж бөглөх";
+  panel.id = "attendance-backfill-panel";
+  panel.hidden = !backfillAttendance;
+  button.setAttribute("aria-controls", panel.id);
+  button.setAttribute("aria-expanded", String(!panel.hidden));
   const form = document.createElement("form");
   const label = document.createElement("label");
   const input = document.createElement("input");
@@ -1549,8 +1549,7 @@ function initBackfillPicker() {
   submit.type = "submit";
   submit.textContent = "Нээх";
   form.append(label, input, submit);
-  picker.append(summary, form);
-  panel.append(picker);
+  panel.append(form);
   if (backfillAttendance) {
     const today = document.createElement("a");
     today.className = "toolbar-btn";
@@ -1559,6 +1558,11 @@ function initBackfillPicker() {
     panel.append(today);
   }
   toolbar.after(panel);
+  button.addEventListener("click", () => {
+    panel.hidden = !panel.hidden;
+    button.setAttribute("aria-expanded", String(!panel.hidden));
+    if (!panel.hidden) input.focus();
+  });
 }
 
 /* ================= GOOGLE SHEETS ================= */
@@ -1851,25 +1855,6 @@ function exportExcel(download = true) {
     fileName,
     fileBase64: XLSX.write(wb, { bookType: "xlsx", type: "base64" })
   };
-}
-
-function exportToGmail() {
-  if (!exportExcel()) return;
-
-  const shift = document.body.dataset.shift || "1";
-  const dateStamp = activeAttendanceDate;
-  const dutyTeacherName = currentDutyTeacherName();
-  const composeUrl = new URL("https://mail.google.com/mail/");
-  composeUrl.searchParams.set("view", "cm");
-  composeUrl.searchParams.set("fs", "1");
-  composeUrl.searchParams.set("to", "t.suwdaa8306@gmail.com");
-  composeUrl.searchParams.set("cc", "sundui920@gmail.com");
-  composeUrl.searchParams.set("su", `${shiftDisplayName(shift)}ийн ирцийн тайлан Жижүүр багш ${dutyTeacherName} - ${dateStamp}`);
-  composeUrl.searchParams.set(
-    "body",
-    `Сайн байна уу,\n\nИрцийн тайлангийн татаж авсан "irts_${shift}_${dateStamp}.xlsx" файлыг энэ имэйлд гараар хавсаргана уу.\n`
-  );
-  window.open(composeUrl.toString(), "_blank", "noopener");
 }
 
 function exportCellValue(cell) {
