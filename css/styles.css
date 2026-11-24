@@ -1023,3 +1023,30 @@ body.admin { border-top: 6px solid #2b6cb0; }
     .sheet tr { background: #fffefd; border-color: #dedede; }
     .attendance-table tfoot tr { background: #f7f5f1; border-color: #b5b5b5; }
 }
+
+.attendance-backfill {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+.attendance-backfill details { max-width: 100%; }
+.attendance-backfill summary { display: inline list-item; }
+.attendance-backfill a { color: inherit; text-decoration: none; }
+.attendance-backfill form {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+}
+.attendance-backfill input {
+    padding: 7px 9px;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    font: inherit;
+}
+@media print { .attendance-backfill { display: none; } }
